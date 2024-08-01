@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-import bayesdll.calibration as calibration
+import BayesDLL.src.bayesdll.calibration as calibration
 
 
 class Runner:
@@ -225,18 +225,6 @@ class Runner:
 
     
     def evaluate(self, test_loader):
-
-        '''
-        Prediction by sample-averaged predictive distibution,
-            (1/S) * \sum_{i=1}^S p(y|x,theta^i) where theta^i ~ q(theta).
-
-        Returns:
-            loss = averaged test CE loss
-            err = averaged test error
-            targets = all groundtruth labels
-            logits = all prediction logits (after sample average)
-            logits_all = all prediction logits (before sample average)
-        '''
 
         args = self.args
 

@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-import BayesDLL.src.bayesdll.calibration as calibration
+import bayesdll.calibration as calibration
 
 
 class Runner:
@@ -24,7 +24,7 @@ class Runner:
         
         self.args = args
         self.logger = logger
-
+        
         # prepare prior backbone (either 0 or pretrained)
         if args.pretrained is None:  # if no pretrained backbone provided, zero out all params
             self.net0 = copy.deepcopy(net)
@@ -35,37 +35,39 @@ class Runner:
             self.net0 = net0
         self.net0 = self.net0.to(args.device)
 
-        # workhorse network (its params will be filled in on the fly)
+        # workhorse network (current LD sample is maintained in here)
         self.net = net.to(args.device)
 
-        # create MC-Dropout inference model (nn.Module)
+        # create langevin mcmc model (nn.Module with actually no parameters)
         hparams = args.hparams
         self.model = Model(
-            self.net if args.pretrained is None else self.net0,  # used as init for m (random init if not pretrained, or pretrained otherwise)
-            ND=args.ND, prior_sig=float(hparams['prior_sig']), p_drop=float(hparams['p_drop']), bias=str(hparams['bias'])
+            ND=args.ND, prior_sig=float(hparams['prior_sig']), bias=str(hparams['bias'])
         ).to(args.device)
 
-        # create optimizer
+        # create optimizer (for workhorse network -- to update LD sample)
         # self.optimizer = torch.optim.SGD(
-        #     self.model.parameters(), 
+        #     self.net.parameters(), 
         #     lr = args.lr, momentum = args.momentum, weight_decay = 0
         # )
         self.optimizer = torch.optim.SGD(
-            [{'params': [p for pn, p in self.model.m.named_parameters() if self.net.readout_name not in pn], 'lr': args.lr},
-             {'params': [p for pn, p in self.model.m.named_parameters() if self.net.readout_name in pn], 'lr': args.lr_head}],
+            [{'params': [p for pn, p in self.net.named_parameters() if self.net.readout_name not in pn], 'lr': args.lr},
+             {'params': [p for pn, p in self.net.named_parameters() if self.net.readout_name in pn], 'lr': args.lr_head}],
             momentum = args.momentum, weight_decay = 0
         )
-        
+
         # TODO: create scheduler?
 
         self.criterion = torch.nn.CrossEntropyLoss()
 
-        self.kld = float(hparams['kld'])  # kl discount factor (factor in data augmentation)
+        self.Ninflate = float(hparams['Ninflate'])  # N inflation factor (factor in data augmentation)
+        self.nd = float(hparams['nd'])  # noise discount
+        self.burnin = int(hparams['burnin'])  # burnin periord (in epochs)
+        self.thin = int(hparams['thin'])  # thinning steps (in batch iters)
         self.nst = int(hparams['nst'])  # number of samples at test time
 
 
     def train(self, train_loader, val_loader, test_loader):
-        
+
         args = self.args
         logger = self.logger
 
@@ -74,8 +76,6 @@ class Runner:
         epoch = 0
 
         losses_train = np.zeros(args.epochs)
-        losses_nll_train = np.zeros(args.epochs)
-        losses_kl_train = np.zeros(args.epochs)
         errors_train = np.zeros(args.epochs)
         if val_loader is not None:
             losses_val = np.zeros(args.epochs)
@@ -86,23 +86,34 @@ class Runner:
         best_loss = np.inf
 
         tic0 = time.time()
+        bi = 0  # batch iteration count
         for ep in range(epoch, args.epochs):
 
             # TODO: Do some optimizer lr scheduling...
 
+            # check if the burnin period is just finished; if so, prepare collecting posterior samples
+            if ep == self.burnin:
+                logger.info('(leaving burnin period) start collecting posterior samples')
+                with torch.no_grad():
+                    theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
+                    self.post_theta_mom1 = theta_vec*1.0  # 1st moment
+                    if self.nst > 0:  # need to maintain sample variances as well
+                        self.post_theta_mom2 = theta_vec**2  # 2nd moment
+                self.post_theta_cnt = 1
+
             tic = time.time()
-            losses_train[ep], errors_train[ep], losses_nll_train[ep], losses_kl_train[ep] = \
-                self.train_one_epoch(train_loader)
+            losses_train[ep], errors_train[ep], bi = self.train_one_epoch(
+                train_loader, collect=(ep>=self.burnin), bi=bi
+            )
             toc = time.time()
 
             prn_str = '[Epoch %d/%d] Training summary: ' % (ep, args.epochs)
-            prn_str += 'loss = %.4f (nll = %.4f, kl = %.4f), prediction error = %.4f ' % (
-                losses_train[ep], losses_nll_train[ep], losses_kl_train[ep], errors_train[ep])
+            prn_str += 'loss = %.4f, prediction error = %.4f ' % (losses_train[ep], errors_train[ep])
             prn_str += '(time: %.4f seconds)' % (toc-tic,)
             logger.info(prn_str)
 
-            # test evaluation
-            if ep % args.test_eval_freq == 0:
+            # test evaluation (only after burnin period)
+            if ep % args.test_eval_freq == 0 and ep >= self.burnin:
 
                 # test on validation set (if available)
                 if val_loader is not None:
@@ -179,47 +190,88 @@ class Runner:
             (toc0-tic0, (toc0-tic0)/args.epochs))
 
 
-    def train_one_epoch(self, train_loader):
+    def train_one_epoch(self, train_loader, collect, bi):
+
+        '''
+        Run SGLD steps for one epoch. May collect posterior samples if post-burnin.
+
+        Args:
+            collect = whether to collect posterior samples or not
+            bi = batch iteration# (used for thinning steps)
+
+        Returns:
+            loss = averaged NLL loss
+            err = averaged classification error
+            bi = updated batch iteration#
+        '''
 
         args = self.args
+        logger = self.logger
 
-        self.model.train()
         self.net.train()
         
-        loss, loss_nll, loss_kl, error, nb_samples = 0, 0, 0, 0, 0
+        loss, error, nb_samples = 0, 0, 0
         with tqdm(train_loader, unit="batch") as tepoch:
             for x, y in tepoch:
 
                 x, y = x.to(args.device), y.to(args.device)
 
-                # evaluate minibatch -ELBO loss for a given a batch
-                loss_, out, loss_nll_, loss_kl_ = self.model(
-                    x, y, self.net, self.net0, self.criterion, self.kld, eval_grad=1
+                # evaluate SGLD updates for a given a batch
+                loss_, out = self.model(
+                    x, y, self.net, self.net0, self.criterion, 
+                    [pg['lr'] for pg in self.optimizer.param_groups],
+                    self.Ninflate, self.nd
                 )
 
-                self.optimizer.step()
+                self.optimizer.step()  # update self.net (ie, theta)
 
                 # prediction on training
                 pred = out.data.max(dim=1)[1]
                 err = pred.ne(y.data).sum()
 
                 loss += loss_ * len(y)
-                loss_nll += loss_nll_ * len(y)
-                loss_kl += loss_kl_ * len(y)
                 error += err.item()
                 nb_samples += len(y)
 
+                bi += 1
+
+                # if post-burnin, collect posterior samples every thinning steps
+                if collect and bi % self.thin == 0:
+                    logger.info('(post-burnin) accumulate posterior samples')
+                    with torch.no_grad():
+                        theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
+                        self.post_theta_mom1 = (theta_vec + self.post_theta_cnt*self.post_theta_mom1) / (self.post_theta_cnt+1)
+                        if self.nst > 0:  # need to maintain sample variances as well
+                            self.post_theta_mom2 = (theta_vec**2 + self.post_theta_cnt*self.post_theta_mom2) / (self.post_theta_cnt+1)
+                    self.post_theta_cnt += 1
+
                 tepoch.set_postfix(loss=loss/nb_samples, error=error/nb_samples)
 
-        return loss/nb_samples, error/nb_samples, loss_nll/nb_samples, loss_kl/nb_samples
+        return loss/nb_samples, error/nb_samples, bi
 
 
     def evaluate(self, test_loader):
 
+        '''
+        Prediction by sample-averaged predictive distibution, 
+            (1/S) * \sum_{i=1}^S p(y|x,theta^i) where theta^i ~ p(theta|D) from SGLD.
+
+        Returns:
+            loss = averaged test CE loss
+            err = averaged test error
+            targets = all groundtruth labels
+            logits = all prediction logits (after sample average)
+            logits_all = all prediction logits (before sample average)
+        '''
+
         args = self.args
 
-        self.model.eval()
-        self.net.eval()
+        # get current posterior mean, vars
+        post_theta_mean, post_theta_vars = self.get_mean_vars_from_moments()
+        
+        net = copy.deepcopy(self.net)  # workhorse network for this evaluation
+
+        net.eval()
         
         loss, error, nb_samples, targets, logits, logits_all = 0, 0, 0, [], [], []
         with tqdm(test_loader, unit="batch") as tepoch:
@@ -230,21 +282,23 @@ class Runner:
                 logits_all_ = []
                 if self.nst == 0:  # use just posterior mean
                     with torch.no_grad():
-                        for p, p_m in zip(self.net.parameters(), self.model.m.parameters()):
+                        for p, p_m in zip(net.parameters(), post_theta_mean.parameters()):
                             p.copy_(p_m)
-                        out = self.net(x)
+                        out = net(x)
                     logits_all_.append(out)
                     logits_all_ = torch.stack(logits_all_, 2)
                     logits_ = F.log_softmax(logits_all_, 1).logsumexp(-1)
                 else:  # use posterior samples
-                    for ii in range(self.nst):  # for each sample theta ~ q(theta)
-                        _, out, _, _ = self.model(
-                            x, y, self.net, self.net0, self.criterion, self.kld, eval_grad=0
-                        )
+                    for ii in range(self.nst):  # for each sample theta ~ p(theta|D)
+                        with torch.no_grad():
+                            for p, p_m, p_v in zip(net.parameters(), post_theta_mean.parameters(), post_theta_vars.parameters()):
+                                eps = torch.randn_like(p)
+                                p.copy_(p_m + p_v.sqrt()*eps)
+                            out = net(x)
                         logits_all_.append(out)
                     logits_all_ = torch.stack(logits_all_, 2)
                     logits_ = F.log_softmax(logits_all_, 1).logsumexp(-1) - np.log(self.nst)
-
+                        
                 loss_ = self.criterion(logits_, y)
 
                 # prediction on test
@@ -267,6 +321,35 @@ class Runner:
         return loss/nb_samples, error/nb_samples, targets, logits, logits_all
 
 
+    def get_mean_vars_from_moments(self):
+
+        '''
+        Compute posterior mean and variances from the momnet statistics.
+
+        Returns:
+            post_theta_mean = net-like nn.Module with posterior mean values
+            post_theta_vars = net-like nn.Module with posterior variance values
+        '''
+
+        with torch.no_grad():
+            post_theta_mean = copy.deepcopy(self.net)
+            nn.utils.vector_to_parameters(self.post_theta_mom1, post_theta_mean.parameters())
+
+        post_theta_vars = None
+        if self.nst > 0:
+            if self.post_theta_cnt > 1:
+                ratio = self.post_theta_cnt / (self.post_theta_cnt - 1)
+            else:
+                ratio = 1.0
+            with torch.no_grad():
+                post_vars_vec = ratio * (self.post_theta_mom2 - self.post_theta_mom1**2)  # unbiased estimate
+                post_vars_vec.clamp_(min=1e-12)  # to avoid numerical error
+                post_theta_vars = copy.deepcopy(self.net)
+                nn.utils.vector_to_parameters(post_vars_vec, post_theta_vars.parameters())
+
+        return post_theta_mean, post_theta_vars
+
+
     def save_logits(self, targets, logits, logits_all, suffix=None):
 
         suffix = '' if suffix is None else f'_{suffix}'
@@ -287,7 +370,10 @@ class Runner:
 
         torch.save(
             {
-                'model': self.model.state_dict(),
+                'post_theta_mom1': self.post_theta_mom1,  
+                'post_theta_mom2': self.post_theta_mom2 if self.nst>0 else None, 
+                'post_theta_cnt': self.post_theta_cnt, 
+                'prior_sig': self.model.prior_sig, 
                 'optimizer': self.optimizer.state_dict(),
                 'epoch': epoch, 
             },
@@ -300,117 +386,101 @@ class Runner:
     def load_ckpt(self, ckpt_path):
         
         ckpt = torch.load(ckpt_path, map_location=self.args.device)
-        
-        self.model.load_state_dict(ckpt['model'])
+
+        self.post_theta_mom1 = ckpt['post_theta_mom1']
+        if ckpt['post_theta_mom2'] is not None:
+            self.post_theta_mom2 = ckpt['post_theta_mom2']
+        self.post_theta_cnt = ckpt['epoch']
+        self.model.prior_sig = ckpt['prior_sig']
         self.optimizer.load_state_dict(ckpt['optimizer'])
 
         return ckpt['epoch']
 
-
+    
 class Model(nn.Module):
 
-    def __init__(self, net, ND, prior_sig=1.0, p_drop=0.0, bias='ignore'):
+    '''
+    SGLD sampler model.
 
+    Actually no parameters involved.
+    '''
 
+    def __init__(self, ND, prior_sig=1.0, bias='informative'):
+
+        '''
+        Args:
+            ND = training data size
+            prior_sig = prior Gaussian sigma
+            bias = how to treat bias parameters:
+                "informative": -- the same treatment as weights
+                "uninformative": uninformative bias prior
+        '''
 
         super().__init__()
 
-        # create network for mc_dropout params "m"
-        self.m = copy.deepcopy(net)
-
         self.ND = ND
         self.prior_sig = prior_sig
-        self.p_drop = p_drop
         self.bias = bias
 
 
-    def forward(self, x, y, net, net0, criterion, kld=1.0, eval_grad=0):
+    def forward(self, x, y, net, net0, criterion, lrs, Ninflate=1.0, nd=1.0):
 
         '''
-        Evaluate minibatch -ELBO loss for a given a batch.
+        Evaluate minibatch SGLD updates for a given a batch.
 
         Args:
             x, y = batch input, output
             net = workhorse network (its parameters will be filled in)
             net0 = prior mean parameters
             criterion = loss function
-            kld = kl discount factor (to factor in data augmentation)
+            lrs = learning rates in list (adjusted to "eta" in SGLD)
+            Ninflate = inflate N by this order of magnitude
+            nd = noise discount factor
 
         Returns:
-            loss = -ELBO on the batch
+            loss = NLL loss on the batch
             out = class prediction on the batch
-            loss_nll = nll part of -ELBO
-            loss_kl = kl part of -ELBO
+
+        Effects:
+            net has .grad fields filled with SGLD updates
         '''
 
-        p_drop = self.p_drop
         bias = self.bias
 
-        # sample theta ~ q(theta), ie, theta = z.*m + (1-z).*theta0, z~Bernoulli(1-p_drop)
-        z_dict = {}
-        with torch.no_grad():
-            for (pname, p), (_, p0), (_, p_m) in zip(net.named_parameters(), net0.named_parameters(), self.m.named_parameters()):
+        N = self.ND * Ninflate  # inflated training data size (accounting for data augmentation, etc.)
 
-                if 'bias' in pname:  # bias params
-                    if bias == 'gaussian':  # gaussian q(theta_bias) -- no dropout for bias params
-                        z = torch.ones_like(p)
-                    elif bias == 'spikymix':  # spiky mixture q(theta_bias) -- bias and weight params treated the same way
-                        z = (torch.rand_like(p) > p_drop).float()
-                    elif bias == 'ignore':  # ignore bias prior/posterior
-                        z = torch.ones_like(p)
-                else:  # weight params
-                    z = (torch.rand_like(p) > p_drop).float()
-                
-                p.copy_(z*p_m + (1-z)*p0)
-
-                if eval_grad:
-                    z_dict[pname] = z  # need z's for gradient evaluation
+        if len(lrs) == 1:
+            lr_body, lr_head = lrs[0], lrs[0]
+        else:
+            lr_body, lr_head = lrs[0], lrs[1]
 
         # fwd pass with theta
-        if eval_grad==0:
-            with torch.no_grad():
-                out = net(x)
-        else:
-            out = net(x)
+        out = net(x)
 
         # evaluate nll loss
-        loss_nll = criterion(out, y)
+        loss = criterion(out, y)
 
         # gradient d{loss_nll}/d{theta}
-        if eval_grad:
-            net.zero_grad()
-            loss_nll.backward()
+        net.zero_grad()
+        loss.backward()
 
-        # evaluate kl loss (before scaled by 1/ND), and also compute the total loss gradient
-        loss_kl = 0.
+        # compute and set: grad = -(1/N) * d{logp(th)}/d{th} + d{loss}/d{th} + sqrt{2/(N*lr)} * N(0,I)
         with torch.no_grad():
-            for (pname, p), (_, p0), (_, p_m) in zip(net.named_parameters(), net0.named_parameters(), self.m.named_parameters()):
-                
-                # kl
-                sig2 = self.prior_sig**2
-                if 'bias' in pname:  # bias params
-                    if bias == 'gaussian':  # gaussian q(theta_bias) -- no dropout for bias params
-                        loss_kl += 0.5*((p_m-p0)**2).sum()/sig2
-                    elif bias == 'spikymix':  # spiky mixture q(theta_bias) -- bias and weight params treated the same way
-                        loss_kl += 0.5*(1.-p_drop)*((p_m-p0)**2).sum()/sig2
-                    elif bias == 'ignore':  # ignore bias prior/posterior
-                        loss_kl += 0.
-                else:  # weight params
-                    loss_kl += 0.5*(1.-p_drop)*((p_m-p0)**2).sum()/sig2
+            for (pname, p), p0 in zip(net.named_parameters(), net0.parameters()):
+                if p.grad is not None:
+                    if net.readout_name not in pname:
+                        lr = lr_body
+                    else:
+                        lr = lr_head
+                    if 'bias' in pname and bias == 'uninformative':
+                        p.grad = p.grad + (
+                            nd * np.sqrt(2/(N*lr)) * torch.randn_like(p)  # sqrt{2/(N*lr)} * N(0,I)
+                        )
+                    else:
+                        p.grad = p.grad + (
+                            (p-p0)/(self.prior_sig**2)/N +  # scaled negative log-prior grad = -(1/N) * d{logp(th)}/d{th}
+                            nd * np.sqrt(2/(N*lr)) * torch.randn_like(p)  # sqrt{2/(N*lr)} * N(0,I)
+                        )
 
-                # gradients
-                if eval_grad and p.grad is not None:
-                    if 'bias' in pname:  # bias params
-                        if bias == 'gaussian':  # gaussian q(theta_bias) -- no dropout for bias params
-                            p_m.grad = p.grad*z_dict[pname] + kld*(p_m-p0)/sig2/self.ND
-                        elif bias == 'spikymix':  # spiky mixture q(theta_bias) -- bias and weight params treated the same way
-                            p_m.grad = p.grad*z_dict[pname] + kld*(1.-p_drop)*(p_m-p0)/sig2/self.ND
-                        elif bias == 'ignore':  # ignore bias prior/posterior
-                            p_m.grad = p.grad*z_dict[pname]
-                    else:  # weight params
-                        p_m.grad = p.grad*z_dict[pname] + kld*(1.-p_drop)*(p_m-p0)/sig2/self.ND
-
-        loss = loss_nll + kld*loss_kl/self.ND
-
-        return loss.item(), out.detach(), loss_nll.item(), loss_kl.item()
+        return loss.item(), out.detach()
 

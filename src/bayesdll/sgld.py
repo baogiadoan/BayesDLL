@@ -9,12 +9,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-import bayesdll.calibration as calibration
+import BayesDLL.src.bayesdll.calibration as calibration
 
 
 class Runner:
 
-    def __init__(self, net, net0, args, logger):
+    def __init__(self, net, net0=None, args=None, logger=None):
 
         '''
         Args:
@@ -252,17 +252,7 @@ class Runner:
 
     def evaluate(self, test_loader):
 
-        '''
-        Prediction by sample-averaged predictive distibution, 
-            (1/S) * \sum_{i=1}^S p(y|x,theta^i) where theta^i ~ p(theta|D) from SGLD.
 
-        Returns:
-            loss = averaged test CE loss
-            err = averaged test error
-            targets = all groundtruth labels
-            logits = all prediction logits (after sample average)
-            logits_all = all prediction logits (before sample average)
-        '''
 
         args = self.args
 
@@ -452,7 +442,11 @@ class Model(nn.Module):
         if len(lrs) == 1:
             lr_body, lr_head = lrs[0], lrs[0]
         else:
-            lr_body, lr_head = lrs[0], lrs[1]
+            # if no lr_head
+            if lrs[1] is None:
+                lr_body, lr_head = lrs[0], lrs[0]
+            else:
+                lr_body, lr_head = lrs[0], lrs[1]
 
         # fwd pass with theta
         out = net(x)

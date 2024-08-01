@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-import bayesdll.calibration as calibration
+import BayesDLL.src.bayesdll.calibration as calibration
 
 
 class Runner:

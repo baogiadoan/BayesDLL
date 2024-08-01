@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
-import BayesDLL.src.bayesdll.calibration as calibration
+import bayesdll.calibration as calibration
 
 
 class Runner:
@@ -24,7 +24,7 @@ class Runner:
         
         self.args = args
         self.logger = logger
-
+        
         # prepare prior backbone (either 0 or pretrained)
         if args.pretrained is None:  # if no pretrained backbone provided, zero out all params
             self.net0 = copy.deepcopy(net)
@@ -38,11 +38,11 @@ class Runner:
         # workhorse network (its params will be filled in on the fly)
         self.net = net.to(args.device)
 
-        # create MC-Dropout inference model (nn.Module)
+        # create variational inference model (nn.Module)
         hparams = args.hparams
         self.model = Model(
             self.net if args.pretrained is None else self.net0,  # used as init for m (random init if not pretrained, or pretrained otherwise)
-            ND=args.ND, prior_sig=float(hparams['prior_sig']), p_drop=float(hparams['p_drop']), bias=str(hparams['bias'])
+            ND=args.ND, prior_sig=float(hparams['prior_sig']), bias=str(hparams['bias'])
         ).to(args.device)
 
         # create optimizer
@@ -52,10 +52,12 @@ class Runner:
         # )
         self.optimizer = torch.optim.SGD(
             [{'params': [p for pn, p in self.model.m.named_parameters() if self.net.readout_name not in pn], 'lr': args.lr},
-             {'params': [p for pn, p in self.model.m.named_parameters() if self.net.readout_name in pn], 'lr': args.lr_head}],
+             {'params': [p for pn, p in self.model.m.named_parameters() if self.net.readout_name in pn], 'lr': args.lr_head},
+             {'params': [p for pn, p in self.model.s_.named_parameters() if self.net.readout_name not in pn], 'lr': args.lr},
+             {'params': [p for pn, p in self.model.s_.named_parameters() if self.net.readout_name in pn], 'lr': args.lr_head}], 
             momentum = args.momentum, weight_decay = 0
         )
-        
+
         # TODO: create scheduler?
 
         self.criterion = torch.nn.CrossEntropyLoss()
@@ -65,7 +67,7 @@ class Runner:
 
 
     def train(self, train_loader, val_loader, test_loader):
-        
+
         args = self.args
         logger = self.logger
 
@@ -85,6 +87,10 @@ class Runner:
 
         best_loss = np.inf
 
+        svec = torch.nn.utils.parameters_to_vector(self.model._retrieve_s().parameters())
+        logger.info('[Epoch -1/%d] s (= std(q)) mean = %.8f, min = %.8f, max = %.8f' % 
+            (args.epochs, svec.mean().item(), svec.min().item(), svec.max().item()))
+
         tic0 = time.time()
         for ep in range(epoch, args.epochs):
 
@@ -100,6 +106,10 @@ class Runner:
                 losses_train[ep], losses_nll_train[ep], losses_kl_train[ep], errors_train[ep])
             prn_str += '(time: %.4f seconds)' % (toc-tic,)
             logger.info(prn_str)
+
+            svec = torch.nn.utils.parameters_to_vector(self.model._retrieve_s().parameters())
+            logger.info('[Epoch %d/%d] s (= std(q)) mean = %.8f, min = %.8f, max = %.8f' % 
+                (ep, args.epochs, svec.mean().item(), svec.min().item(), svec.max().item()))
 
             # test evaluation
             if ep % args.test_eval_freq == 0:
@@ -197,7 +207,7 @@ class Runner:
                     x, y, self.net, self.net0, self.criterion, self.kld, eval_grad=1
                 )
 
-                self.optimizer.step()
+                self.optimizer.step()  # update self.model.{m,s_}
 
                 # prediction on training
                 pred = out.data.max(dim=1)[1]
@@ -213,8 +223,20 @@ class Runner:
 
         return loss/nb_samples, error/nb_samples, loss_nll/nb_samples, loss_kl/nb_samples
 
-
+    
     def evaluate(self, test_loader):
+
+        '''
+        Prediction by sample-averaged predictive distibution,
+            (1/S) * \sum_{i=1}^S p(y|x,theta^i) where theta^i ~ q(theta).
+
+        Returns:
+            loss = averaged test CE loss
+            err = averaged test error
+            targets = all groundtruth labels
+            logits = all prediction logits (after sample average)
+            logits_all = all prediction logits (before sample average)
+        '''
 
         args = self.args
 
@@ -238,9 +260,10 @@ class Runner:
                     logits_ = F.log_softmax(logits_all_, 1).logsumexp(-1)
                 else:  # use posterior samples
                     for ii in range(self.nst):  # for each sample theta ~ q(theta)
-                        _, out, _, _ = self.model(
-                            x, y, self.net, self.net0, self.criterion, self.kld, eval_grad=0
-                        )
+                        with torch.no_grad():
+                            _, out, _, _ = self.model(
+                                x, y, self.net, self.net0, self.criterion, self.kld, eval_grad=0
+                            )
                         logits_all_.append(out)
                     logits_all_ = torch.stack(logits_all_, 2)
                     logits_ = F.log_softmax(logits_all_, 1).logsumexp(-1) - np.log(self.nst)
@@ -266,7 +289,7 @@ class Runner:
 
         return loss/nb_samples, error/nb_samples, targets, logits, logits_all
 
-
+    
     def save_logits(self, targets, logits, logits_all, suffix=None):
 
         suffix = '' if suffix is None else f'_{suffix}'
@@ -287,7 +310,8 @@ class Runner:
 
         torch.save(
             {
-                'model': self.model.state_dict(),
+                'model': self.model.state_dict(), 
+                'prior_sig': self.model.prior_sig, 
                 'optimizer': self.optimizer.state_dict(),
                 'epoch': epoch, 
             },
@@ -302,6 +326,7 @@ class Runner:
         ckpt = torch.load(ckpt_path, map_location=self.args.device)
         
         self.model.load_state_dict(ckpt['model'])
+        self.model.prior_sig = ckpt['prior_sig']
         self.optimizer.load_state_dict(ckpt['optimizer'])
 
         return ckpt['epoch']
@@ -309,21 +334,50 @@ class Runner:
 
 class Model(nn.Module):
 
-    def __init__(self, net, ND, prior_sig=1.0, p_drop=0.0, bias='ignore'):
+    '''
+    Variational inference model.
 
+    Represents q(theta) = N(theta; m, Diag(v)) where v = s^2 (s = clamp(s_,min=1e-8)).
+    '''
 
+    def __init__(self, net, ND, prior_sig=1.0, bias='informative'):
+
+        '''
+        Args:
+            net = either pretrained or random init backbone (init for m)
+            ND = training data size
+            prior_sig = prior Gaussian sigma
+            bias = how to treat bias parameters:
+                "informative": -- the same treatment as weights
+                "uninformative": uninformative bias prior
+        '''
 
         super().__init__()
 
-        # create network for mc_dropout params "m"
+        # create networks for vi params "m" and "s_"
         self.m = copy.deepcopy(net)
+        self.s_ = copy.deepcopy(net)
+
+        # initialize s_
+        with torch.no_grad():
+            for param in self.s_.parameters():
+                param.copy_((1e-6)*torch.ones_like(param))  # small value
 
         self.ND = ND
         self.prior_sig = prior_sig
-        self.p_drop = p_drop
         self.bias = bias
 
+    
+    def _retrieve_s(self):
+        
+        s = copy.deepcopy(self.s_)
+        with torch.no_grad():
+            for psrc, ptgt in zip(self.s_.parameters(), s.parameters()):
+                ptgt.copy_(psrc.clamp(min=1e-8))
 
+        return s
+
+        
     def forward(self, x, y, net, net0, criterion, kld=1.0, eval_grad=0):
 
         '''
@@ -337,34 +391,19 @@ class Model(nn.Module):
             kld = kl discount factor (to factor in data augmentation)
 
         Returns:
-            loss = -ELBO on the batch
+            loss = -ELBO on the batch; scalar
             out = class prediction on the batch
             loss_nll = nll part of -ELBO
             loss_kl = kl part of -ELBO
         '''
 
-        p_drop = self.p_drop
         bias = self.bias
 
-        # sample theta ~ q(theta), ie, theta = z.*m + (1-z).*theta0, z~Bernoulli(1-p_drop)
-        z_dict = {}
+        # sample theta ~ q(theta), ie, theta = m + eps*s, eps~N(0,I)
         with torch.no_grad():
-            for (pname, p), (_, p0), (_, p_m) in zip(net.named_parameters(), net0.named_parameters(), self.m.named_parameters()):
-
-                if 'bias' in pname:  # bias params
-                    if bias == 'gaussian':  # gaussian q(theta_bias) -- no dropout for bias params
-                        z = torch.ones_like(p)
-                    elif bias == 'spikymix':  # spiky mixture q(theta_bias) -- bias and weight params treated the same way
-                        z = (torch.rand_like(p) > p_drop).float()
-                    elif bias == 'ignore':  # ignore bias prior/posterior
-                        z = torch.ones_like(p)
-                else:  # weight params
-                    z = (torch.rand_like(p) > p_drop).float()
-                
-                p.copy_(z*p_m + (1-z)*p0)
-
-                if eval_grad:
-                    z_dict[pname] = z  # need z's for gradient evaluation
+            for p, p_m, p_s_ in zip(net.parameters(), self.m.parameters(), self.s_.parameters()):
+                eps = torch.randn_like(p)
+                p.copy_(p_m + p_s_.clamp(min=1e-8)*eps)
 
         # fwd pass with theta
         if eval_grad==0:
@@ -384,31 +423,21 @@ class Model(nn.Module):
         # evaluate kl loss (before scaled by 1/ND), and also compute the total loss gradient
         loss_kl = 0.
         with torch.no_grad():
-            for (pname, p), (_, p0), (_, p_m) in zip(net.named_parameters(), net0.named_parameters(), self.m.named_parameters()):
+            for (pname, p), p0, p_m, p_s_ in zip(net.named_parameters(), net0.parameters(), self.m.parameters(), self.s_.parameters()):
                 
                 # kl
-                sig2 = self.prior_sig**2
-                if 'bias' in pname:  # bias params
-                    if bias == 'gaussian':  # gaussian q(theta_bias) -- no dropout for bias params
-                        loss_kl += 0.5*((p_m-p0)**2).sum()/sig2
-                    elif bias == 'spikymix':  # spiky mixture q(theta_bias) -- bias and weight params treated the same way
-                        loss_kl += 0.5*(1.-p_drop)*((p_m-p0)**2).sum()/sig2
-                    elif bias == 'ignore':  # ignore bias prior/posterior
-                        loss_kl += 0.
-                else:  # weight params
-                    loss_kl += 0.5*(1.-p_drop)*((p_m-p0)**2).sum()/sig2
+                if not ('bias' in pname and bias == 'uninformative'):
+                    d = p.numel()
+                    sig2 = self.prior_sig**2
+                    s = p_s_.clamp(min=1e-8)
+                    v = s**2
+                    loss_kl += 0.5 * ( (((p_m-p0)**2+v)/sig2).sum() - (v/sig2).log().sum() - d )
 
                 # gradients
                 if eval_grad and p.grad is not None:
-                    if 'bias' in pname:  # bias params
-                        if bias == 'gaussian':  # gaussian q(theta_bias) -- no dropout for bias params
-                            p_m.grad = p.grad*z_dict[pname] + kld*(p_m-p0)/sig2/self.ND
-                        elif bias == 'spikymix':  # spiky mixture q(theta_bias) -- bias and weight params treated the same way
-                            p_m.grad = p.grad*z_dict[pname] + kld*(1.-p_drop)*(p_m-p0)/sig2/self.ND
-                        elif bias == 'ignore':  # ignore bias prior/posterior
-                            p_m.grad = p.grad*z_dict[pname]
-                    else:  # weight params
-                        p_m.grad = p.grad*z_dict[pname] + kld*(1.-p_drop)*(p_m-p0)/sig2/self.ND
+                    if not ('bias' in pname and bias == 'uninformative'):
+                        p_m.grad = p.grad + kld*(p_m-p0)/sig2/self.ND
+                        p_s_.grad = p.grad*((p-p_m)/s) + kld*(s/sig2-1/s)/self.ND
 
         loss = loss_nll + kld*loss_kl/self.ND
 
