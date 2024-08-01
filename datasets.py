@@ -15,10 +15,12 @@ def prepare(args, data_root='./data', train_data_aug=True):
 
         # data augmentation
         transform_train = transforms.Compose([
+            transforms.Resize(32),
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.1307,), std=(0.3081,))
         ])
         transform_test = transforms.Compose([
+            transforms.Resize(32),
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.1307,), std=(0.3081,))
         ])

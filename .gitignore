@@ -1,0 +1,6 @@
+__pycache__/
+bayesdll.egg-info/dependency_links.txt
+bayesdll.egg-info/PKG-INFO
+bayesdll.egg-info/SOURCES.txt
+bayesdll.egg-info/top_level.txt
+dist/bayesdll-0.0.0-py3.12.egg
